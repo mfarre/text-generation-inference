@@ -1133,6 +1133,7 @@ pub struct Url {
 pub enum MessageChunk {
     Text { text: String },
     ImageUrl { image_url: Url },
+    Video { video_url: Url },
 }
 
 #[derive(Clone, Deserialize, ToSchema, Serialize, Debug, PartialEq)]

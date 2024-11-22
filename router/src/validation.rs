@@ -5,6 +5,9 @@ use crate::{
     GenerateParameters, GenerateRequest, GrammarType, HubPreprocessorConfig, Idefics2Preprocessor,
     TokenizerTrait,
 };
+use ffmpeg_next as ffmpeg;
+use std::io::Write;
+
 use crate::{PyTokenizer, Tokenizer};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use image::{ImageFormat, ImageReader};
@@ -19,6 +22,11 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::{instrument, Span};
 use {once_cell::sync::Lazy, regex::Regex};
+
+/// Video constants
+const TARGET_WIDTH: u32 = 360;
+const TARGET_HEIGHT: u32 = 420;
+const TARGET_FPS: u32 = 1;  // Sample at 1fps
 
 /// Validation
 #[derive(Debug, Clone)]
@@ -516,15 +524,15 @@ fn format_to_mimetype(format: ImageFormat) -> String {
     .to_string()
 }
 
-pub fn fetch_video(input: &str) -> Result<(Vec<u8>, String, usize, usize, f32), ValidationError> {
+pub fn fetch_video(input: &str) -> Result<ProcessedVideo, ValidationError> {
     let (data, mimetype) =
-        if input.starts_with("<video>(http://") || input.starts_with("<video>(https://") {
-            let url = &input["<video>(".len()..input.len() - 1];
+        if input.starts_with("(http://") || input.starts_with("(https://") {
+            let url = &input["(".len()..input.len() - 1];
             let data = reqwest::blocking::get(url)?.bytes()?.to_vec();
             (data, "video/mp4".to_string())
-        } else if input.starts_with("<video>(data:") {
-            let content = &input["<video>(data:".len()..input.len() - 1];
-            let tokens: Vec<_> = content.split(';').collect();
+        } else if input.starts_with("(data:") {
+            let content = &input["(data:".len()..input.len() - 1];
+            let tokens: Vec<&str> = content.split(';').collect();
             if tokens.len() != 2 {
                 return Err(ValidationError::InvalidVideoContent(content.to_string()));
             }
@@ -539,45 +547,109 @@ pub fn fetch_video(input: &str) -> Result<(Vec<u8>, String, usize, usize, f32), 
             return Err(ValidationError::InvalidVideoContent(input.to_string()));
         };
 
-    let mut cursor = Cursor::new(&data);
-    let context = mp4parse::read_mp4(&mut cursor).map_err(|_| ValidationError::MP4Error)?;
+    // Initialize ffmpeg
+    ffmpeg::init().map_err(|_| ValidationError::FFmpegError)?;
 
-    let video_track = context
-        .tracks
-        .iter()
-        .find(|track| track.track_type == mp4parse::TrackType::Video)
+    // Create temporary file for ffmpeg input
+    let mut temp_file = tempfile::NamedTempFile::new().map_err(ValidationError::IoError)?;
+    temp_file.write_all(&data).map_err(ValidationError::IoError)?;
+    
+    let input_ctx = ffmpeg::format::input(&temp_file.path())
+        .map_err(|_| ValidationError::FFmpegError)?;
+
+    let video_stream = input_ctx
+        .streams()
+        .best(ffmpeg::media::Type::Video)
         .ok_or(ValidationError::NoVideoStream)?;
 
-    let video_info = video_track
-        .tkhd
-        .as_ref()
-        .ok_or(ValidationError::NoVideoStream)?;
-    let width = (video_info.width >> 16) as usize;
-    let height = (video_info.height >> 16) as usize;
+    // Get video metadata
+    let time_base = video_stream.time_base();
+    let fps = 1.0_f32 / f64::from(time_base.numerator()) as f32 * f64::from(time_base.denominator()) as f32;
+    let total_frames = video_stream.frames() as usize;
 
-    // timescale units per second
-    let timescale = video_track.timescale.map(|t| t.0 as f32).unwrap_or(600.0);
+    // Setup decoder
+    let context_decoder = ffmpeg::codec::context::Context::from_parameters(video_stream.parameters())
+        .map_err(|_| ValidationError::FFmpegError)?;
+    let mut decoder = context_decoder
+        .decoder()
+        .video()
+        .map_err(|_| ValidationError::FFmpegError)?;
 
-    // TODO: revisit if we need duration in seconds
-    let _duration = video_track
-        .duration
-        .map(|d| d.0 as f32 / timescale)
-        .unwrap_or(0.0);
+    // Calculate dimensions
+    let (width, height) = if decoder.width() > TARGET_WIDTH || decoder.height() > TARGET_HEIGHT {
+        let ratio = (TARGET_WIDTH as f32 / decoder.width() as f32)
+            .min(TARGET_HEIGHT as f32 / decoder.height() as f32);
+        let width = (decoder.width() as f32 * ratio) as u32;
+        let height = (decoder.height() as f32 * ratio) as u32;
+        (width as usize, height as usize)
+    } else {
+        (decoder.width() as usize, decoder.height() as usize)
+    };
 
-    let time_to_sample = video_track
-        .stts
-        .as_ref()
-        .ok_or(ValidationError::NoVideoStream)?;
+    // Setup scaler if needed
+    let mut scaler = if width != decoder.width() as usize || height != decoder.height() as usize {
+        Some(ffmpeg::software::scaling::Context::get(
+            decoder.format(),
+            decoder.width(),
+            decoder.height(),
+            ffmpeg::format::Pixel::RGB24,
+            width as u32,
+            height as u32,
+            ffmpeg::software::scaling::Flags::BILINEAR,
+        ).map_err(|_| ValidationError::FFmpegError)?)
+    } else {
+        None
+    };
 
-    let num_samples = time_to_sample
-        .samples
-        .iter()
-        .map(|entry| entry.sample_count)
-        .sum::<u32>();
+    // Sample frames at 1fps
+    let mut frames = Vec::new();
+    let frame_interval = (fps / TARGET_FPS as f32).round() as usize;
+    let mut frame_count = 0;
+    let mut receive_frame = ffmpeg::frame::Video::empty();
+    
+    while let Ok(..) = decoder.receive_frame(&mut receive_frame) {
+        if frame_count % frame_interval == 0 {
+            let mut rgb_frame = if let Some(scaler) = scaler.as_mut() {
+                let mut scaled = ffmpeg::frame::Video::empty();
+                scaler.run(&receive_frame, &mut scaled)
+                    .map_err(|_| ValidationError::FFmpegError)?;
+                scaled
+            } else {
+                receive_frame.clone()
+            };
 
-    let total_frames = num_samples as f32;
+            // Convert to RGB if needed
+            if rgb_frame.format() != ffmpeg::format::Pixel::RGB24 {
+                let mut rgb = ffmpeg::frame::Video::empty();
+                let mut rgb_scaler = ffmpeg::software::scaling::Context::get(
+                    rgb_frame.format(),
+                    width as u32,
+                    height as u32,
+                    ffmpeg::format::Pixel::RGB24,
+                    width as u32,
+                    height as u32,
+                    ffmpeg::software::scaling::Flags::BILINEAR,
+                ).map_err(|_| ValidationError::FFmpegError)?;
+                rgb_scaler.run(&rgb_frame, &mut rgb)
+                    .map_err(|_| ValidationError::FFmpegError)?;
+                rgb_frame = rgb;
+            }
 
-    Ok((data, mimetype, height, width, total_frames))
+            // Extract RGB data
+            let frame_data: Vec<u8> = rgb_frame.data(0).to_vec();
+            frames.push(frame_data);
+        }
+        frame_count += 1;
+    }
+
+    Ok(ProcessedVideo {
+        mimetype,
+        height,
+        width,
+        frames,
+        fps,
+        total_frames,
+    })
 }
 
 fn fetch_image(input: &str) -> Result<(Vec<u8>, String, usize, usize), ValidationError> {
@@ -674,12 +746,10 @@ fn video_tokens(config: &Config, height: usize, width: usize, total_frames: f32)
     match config {
         // TOOD: improve to use the config to better estimate the number of tokens
         Qwen2Vl(_config) => {
-            let video_fps = 30_f32;
-            let fps = 30_f32;
-            let min_frames = 16_f32;
-            let max_frames = 64_f32;
+            let min_frames = 2_f32;
+            let max_frames = 256_f32;
             // make sure the frames are within the range and are even
-            let nframes = (total_frames / video_fps * fps)
+            let nframes = (total_frames)
                 .max(min_frames)
                 .min(max_frames);
             let nframes = (nframes / 2.0).round() as usize * 2;
@@ -734,10 +804,10 @@ fn prepare_input<T: TokenizerTrait>(
                     input_chunks.push(Chunk::Text(inputs[start..chunk_start].to_string()));
                     tokenizer_query.push_str(&inputs[start..chunk_start]);
                 }
-                let (data, mimetype, height, width, total_frames) =
+                let ProcessedVideo { mimetype, height, width, frames, fps: _, total_frames: _ } =
                     fetch_video(&inputs[chunk_start..chunk_end])?;
-                input_chunks.push(Chunk::Video(Video { data, mimetype }));
-                let video_tokens = video_tokens(config, height, width, total_frames);
+                input_chunks.push(Chunk::Video(Video { frames: frames.clone(), mimetype }));
+                let video_tokens = video_tokens(config, height, width, frames.len() as f32);
                 tokenizer_query.push_str(&video_tokens);
                 start = chunk_end;
             }
@@ -790,9 +860,18 @@ pub struct Image {
     pub mimetype: String,
 }
 
+pub struct ProcessedVideo {
+    mimetype: String,
+    height: usize,
+    width: usize,
+    frames: Vec<Vec<u8>>, // RGB frames
+    fps: f32,
+    total_frames: usize,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Video {
-    pub data: Vec<u8>,
+    pub frames: Vec<Vec<u8>>,
     pub mimetype: String,
 }
 
@@ -819,8 +898,9 @@ impl ChunksToString for Vec<Chunk> {
                 let encoded = STANDARD.encode(data);
                 output.push_str(&format!("![](data:{};base64,{})", mimetype, encoded))
             }
-            Chunk::Video(Video { data, mimetype }) => {
-                let encoded = STANDARD.encode(data);
+            Chunk::Video(Video { frames, mimetype }) => {
+                // For backward compatibility, we'll just use the first frame's data
+                let encoded = STANDARD.encode(frames.first().unwrap_or(&Vec::new()));
                 output.push_str(&format!("<video>(data:{};base64,{})", mimetype, encoded))
             }
         });
@@ -953,6 +1033,10 @@ pub enum ValidationError {
     MP4Error,
     #[error("no video stream found")]
     NoVideoStream,
+    #[error("io error: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("ffmpeg error")]
+    FFmpegError,
 }
 
 #[cfg(test)]

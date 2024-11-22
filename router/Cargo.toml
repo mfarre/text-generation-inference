@@ -8,6 +8,8 @@ authors.workspace = true
 homepage.workspace = true
 
 [dependencies]
+ffmpeg-next = "7.1.0"
+tempfile = "3.10.1"
 async-trait = "0.1.74"
 async-stream = "0.3.5"
 axum = { version = "0.7", features = ["json"] }

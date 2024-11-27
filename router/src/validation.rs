@@ -812,7 +812,12 @@ fn prepare_input<T: TokenizerTrait>(
                             default_target_height,
                         )?
                     }
-                    Qwen2Vl(_) => fetch_video(&inputs[chunk_start..chunk_end], 360, 420)?,
+                    Qwen2Vl(_) => {
+                        // TODO: improve to send the full size video (do not divide by 2)
+                        let target_width = 360 / 2;
+                        let target_height = 420 / 2;
+                        fetch_video(&inputs[chunk_start..chunk_end], target_width, target_height)?
+                    }
                     _ => {
                         unreachable!("Video tokens are not supported for this model configuration")
                     }
@@ -828,29 +833,29 @@ fn prepare_input<T: TokenizerTrait>(
                 start = chunk_end;
             }
 
-            // clip remaining inputs and process images
-            let remaining_input = &inputs[start..];
-            for chunk in RE.find_iter(remaining_input) {
-                let chunk_start = chunk.start() + start;
-                let chunk_end = chunk.end() + start;
+            // handle image content after video content
+            for chunk in RE.find_iter(&inputs) {
+                let chunk_start = chunk.start();
+                let chunk_end = chunk.end();
                 if chunk_start != start {
                     input_chunks.push(Chunk::Text(inputs[start..chunk_start].to_string()));
                     tokenizer_query.push_str(&inputs[start..chunk_start]);
                 }
                 let (data, mimetype, height, width) = fetch_image(&inputs[chunk_start..chunk_end])?;
-                input_chunks.push(Chunk::Image(Image { data, mimetype }));
+                input_chunks.push(Chunk::Image(Image {
+                    data,
+                    mimetype: mimetype.clone(),
+                }));
                 tokenizer_query.push_str(&image_tokens(config, preprocessor_config, height, width));
                 start = chunk_end;
             }
-
-            // Add any remaining text
             if start != inputs.len() {
                 input_chunks.push(Chunk::Text(inputs[start..].to_string()));
                 tokenizer_query.push_str(&inputs[start..]);
             }
 
-            // Apply any necessary token fixups
             tokenizer_query = image_tokens_fixup(config, tokenizer_query);
+
             (tokenizer_query, input_chunks)
         }
         _ => (inputs.clone(), vec![Chunk::Text(inputs)]),

@@ -616,7 +616,8 @@ pub fn fetch_video(
 
     for (stream, packet) in ictx.packets() {
         total_frames = stream.frames();
-        fps = stream.rate().numerator() as f32 / stream.rate().denominator() as f32;
+        // Floor the fps to get a whole number
+        fps = (stream.rate().numerator() as f32 / stream.rate().denominator() as f32).floor();
 
         if stream.index() == video_stream_index {
             decoder

@@ -604,16 +604,7 @@ pub fn fetch_video(
                 let mut rgb_frame = ffmpeg::util::frame::video::Video::empty();
                 scaler.run(&decoded, &mut rgb_frame)?;
                 if frame_index as f32 % fps == 0.0 {
-                    println!(
-                        "Frame dimensions - Width: {}, Height: {}, Data length: {}, Stride: {}", 
-                        rgb_frame.width(),
-                        rgb_frame.height(),
-                        rgb_frame.data(0).len(),
-                        rgb_frame.stride(0)
-                    );
                     captured_frame_index += 1;
-                    //frames.push(rgb_frame.data(0).to_vec());
-
                     // Create new buffer without padding
                     let mut frame_data = Vec::with_capacity((rgb_frame.width() * rgb_frame.height() * 3) as usize);
                     let src_data = rgb_frame.data(0);
@@ -625,12 +616,7 @@ pub fn fetch_video(
                         let end = start + row_size;
                         frame_data.extend_from_slice(&src_data[start..end]);
                     }
-                    
-                    println!("Frame data size after padding removal: {}", frame_data.len());
                     frames.push(frame_data);
-
-                    println!("Captured frame at index {frame_index}, fps: {fps}, total captured: {captured_frame_index}");
-
                 }
                 frame_index += 1;
             }
@@ -842,10 +828,6 @@ fn prepare_input<T: TokenizerTrait>(
                         unreachable!("Video tokens are not supported for this model configuration")
                     }
                 };
-
-                let data = processed_video.frames.iter().flatten().cloned().collect::<Vec<u8>>();
-                println!("Data size: {}, Expected size per frame: {}", data.len(), processed_video.height as usize * processed_video.width as usize * 3);
-                println!("Number of frames: {}", processed_video.frames.len());
 
                 input_chunks.push(Chunk::Video(Video {
                     data: processed_video.frames.iter().flatten().cloned().collect(),

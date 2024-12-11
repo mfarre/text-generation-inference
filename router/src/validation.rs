@@ -597,14 +597,40 @@ pub fn fetch_video(
     let mut frames = vec![];
 
     let mut receive_and_process_decoded_frames =
-        |decoder: &mut ffmpeg::decoder::Video, fps: f32| -> Result<(), ffmpeg::Error> {
+        |decoder: &mut ffmpeg::decoder::Video, raw_fps: f32| -> Result<(), ffmpeg::Error> {
             let mut decoded = ffmpeg::util::frame::video::Video::empty();
+            let fps = raw_fps.floor();
             while decoder.receive_frame(&mut decoded).is_ok() {
                 let mut rgb_frame = ffmpeg::util::frame::video::Video::empty();
                 scaler.run(&decoded, &mut rgb_frame)?;
                 if frame_index as f32 % fps == 0.0 {
+                    println!(
+                        "Frame dimensions - Width: {}, Height: {}, Data length: {}, Stride: {}", 
+                        rgb_frame.width(),
+                        rgb_frame.height(),
+                        rgb_frame.data(0).len(),
+                        rgb_frame.stride(0)
+                    );
                     captured_frame_index += 1;
-                    frames.push(rgb_frame.data(0).to_vec());
+                    //frames.push(rgb_frame.data(0).to_vec());
+
+                    // Create new buffer without padding
+                    let mut frame_data = Vec::with_capacity((rgb_frame.width() * rgb_frame.height() * 3) as usize);
+                    let src_data = rgb_frame.data(0);
+                    let row_size = rgb_frame.width() as usize * 3;
+                    
+                    // Copy each row without padding
+                    for y in 0..rgb_frame.height() as usize {
+                        let start = y * rgb_frame.stride(0) as usize;
+                        let end = start + row_size;
+                        frame_data.extend_from_slice(&src_data[start..end]);
+                    }
+                    
+                    println!("Frame data size after padding removal: {}", frame_data.len());
+                    frames.push(frame_data);
+
+                    println!("Captured frame at index {frame_index}, fps: {fps}, total captured: {captured_frame_index}");
+
                 }
                 frame_index += 1;
             }
@@ -643,6 +669,7 @@ pub fn fetch_video(
         frames,
         fps,
         total_frames,
+        sampled_frames: captured_frame_index,
     })
 }
 
@@ -734,7 +761,7 @@ fn image_tokens(
     }
 }
 
-fn video_tokens(config: &Config, height: u32, width: u32, total_frames: f32) -> String {
+fn video_tokens(config: &Config, height: u32, width: u32, sampled_frames: f32) -> String {
     use Config::*;
 
     match config {
@@ -743,7 +770,7 @@ fn video_tokens(config: &Config, height: u32, width: u32, total_frames: f32) -> 
             let min_frames = 2_f32;
             let max_frames = 256_f32;
             // make sure the frames are within the range and are even
-            let nframes = (total_frames).max(min_frames).min(max_frames);
+            let nframes = (sampled_frames).max(min_frames).min(max_frames);
             let nframes = (nframes / 2.0).round() as usize * 2;
             let num_tokens = nframes * height as usize * width as usize / 1541;
             format!(
@@ -765,7 +792,6 @@ fn image_tokens_fixup(config: &Config, text: String) -> String {
     }
 }
 
-/// Get input length and optionally truncate it
 fn prepare_input<T: TokenizerTrait>(
     inputs: String,
     _truncate: Option<usize>,
@@ -796,14 +822,7 @@ fn prepare_input<T: TokenizerTrait>(
                     input_chunks.push(Chunk::Text(inputs[start..chunk_start].to_string()));
                     tokenizer_query.push_str(&inputs[start..chunk_start]);
                 }
-                let ProcessedVideo {
-                    mimetype,
-                    height,
-                    width,
-                    frames,
-                    fps,
-                    total_frames,
-                } = match config {
+                let processed_video = match config {
                     Idefics | Mllama | Idefics2(_) | Paligemma(_) | LlavaNext(_) => {
                         let default_target_width = 224;
                         let default_target_height = 224;
@@ -823,13 +842,24 @@ fn prepare_input<T: TokenizerTrait>(
                         unreachable!("Video tokens are not supported for this model configuration")
                     }
                 };
+
+                let data = processed_video.frames.iter().flatten().cloned().collect::<Vec<u8>>();
+                println!("Data size: {}, Expected size per frame: {}", data.len(), processed_video.height as usize * processed_video.width as usize * 3);
+                println!("Number of frames: {}", processed_video.frames.len());
+
                 input_chunks.push(Chunk::Video(Video {
-                    data: frames.iter().flatten().cloned().collect(),
-                    mimetype,
-                    width,
-                    num_frames: (total_frames as f32 / fps) as u32,
+                    data: processed_video.frames.iter().flatten().cloned().collect(),
+                    mimetype: processed_video.mimetype.clone(),
+                    width: processed_video.width,
+                    height: processed_video.height,
+                    num_frames: processed_video.frames.len() as u32,
                 }));
-                let video_tokens = video_tokens(config, height, width, total_frames as f32);
+                let video_tokens = video_tokens(
+                    config,
+                    processed_video.height,
+                    processed_video.width,
+                    processed_video.sampled_frames as f32,
+                );
                 tokenizer_query.push_str(&video_tokens);
                 start = chunk_end;
             }
@@ -889,6 +919,7 @@ pub struct ProcessedVideo {
     frames: Vec<Vec<u8>>, // RGB frames
     fps: f32,
     total_frames: usize,
+    sampled_frames: usize,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -896,6 +927,7 @@ pub struct Video {
     pub data: Vec<u8>,
     pub mimetype: String,
     pub width: u32,
+    pub height: u32,
     pub num_frames: u32,
 }
 
@@ -926,6 +958,7 @@ impl ChunksToString for Vec<Chunk> {
                 data,
                 mimetype,
                 width,
+                height,
                 num_frames: _,
             }) => {
                 // TODO: revisit if we should limit video support to v3 - to avoid sending very large base64 strings

@@ -819,9 +819,8 @@ fn prepare_input<T: TokenizerTrait>(
                         )?
                     }
                     Qwen2Vl(_) => {
-                        // TODO: improve to send the full size video (do not divide by 2)
-                        let target_width = 360 / 2;
-                        let target_height = 420 / 2;
+                        let target_width = 360;
+                        let target_height = 420;
                         fetch_video(&inputs[chunk_start..chunk_end], target_width, target_height)?
                     }
                     _ => {

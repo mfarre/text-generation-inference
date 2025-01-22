@@ -1,0 +1,422 @@
+diff --git a/router/src/validation.rs b/router/src/validation.rs
+index 49c0b5c8..4f578951 100644
+--- a/router/src/validation.rs
++++ b/router/src/validation.rs
+@@ -5,11 +5,11 @@ use crate::{
+     GenerateParameters, GenerateRequest, GrammarType, HubPreprocessorConfig, Idefics2Preprocessor,
+     TokenizerTrait,
+ };
+-use ffmpeg_next as ffmpeg;
+-use std::io::Write;
+-
+-use crate::{PyTokenizer, Tokenizer};
++use std::process::Command;
++use std::io::{Write, BufReader, BufRead, Read};
++use tempfile::NamedTempFile;
+ use base64::{engine::general_purpose::STANDARD, Engine};
++use crate::{PyTokenizer, Tokenizer};
+ use image::{ImageFormat, ImageReader};
+ use jsonschema::{Draft, JSONSchema};
+ use outlines_core::json_schema::to_regex as json_schema_to_regex;
+@@ -23,10 +23,6 @@ use tokio::sync::mpsc;
+ use tokio::sync::oneshot;
+ use tracing::{instrument, Span};
+ use {once_cell::sync::Lazy, regex::Regex};
+-// video processing
+-use ffmpeg::media::Type;
+-use ffmpeg::software::scaling::{context::Context, flag::Flags};
+-use ffmpeg_next::format::Pixel;
+ 
+ /// Validation
+ #[derive(Debug, Clone)]
+@@ -526,139 +522,248 @@ fn format_to_mimetype(format: ImageFormat) -> String {
+     .to_string()
+ }
+ 
++
+ pub fn fetch_video(
+     input: &str,
+     target_width: u32,
+     target_height: u32,
+ ) -> Result<ProcessedVideo, ValidationError> {
+-    let (data, mimetype) =
+-        if input.starts_with("<video>(http://") || input.starts_with("<video>(https://") {
+-            let url = &input["<video>(".len()..input.len() - 1];
+-            let data = reqwest::blocking::get(url)?.bytes()?.to_vec();
+-            (data, "video/mp4".to_string())
+-        } else if input.starts_with("<video>(data:") {
+-            let content = &input["<video>(data:".len()..input.len() - 1];
+-            let tokens: Vec<&str> = content.split(';').collect();
+-            if tokens.len() != 2 {
+-                return Err(ValidationError::InvalidVideoContent(content.to_string()));
+-            }
+-            let mimetype = tokens[0];
+-            let content = tokens[1];
+-            if !content.starts_with("base64,") {
+-                return Err(ValidationError::InvalidVideoContent(content.to_string()));
+-            }
+-            let data = STANDARD.decode(&content["base64,".len()..])?;
+-            (data, mimetype.to_string())
+-        } else {
+-            return Err(ValidationError::InvalidVideoContent(input.to_string()));
+-        };
++    println!("Starting video processing with dimensions: {}x{}", target_width, target_height);
++    
++    // Extract video data and create input source
++    let (data, mimetype, source_path, _temp_holder) = if input.starts_with("<video>(http://") || input.starts_with("<video>(https://") {
++        println!("Detected URL input");
++        let url = &input["<video>(".len()..input.len() - 1];
++        println!("Extracted URL: {}", url);
++        (Vec::new(), "video/mp4".to_string(), url.to_string(), None)
++    } else if input.starts_with("<video>(data:") {
++        println!("Detected base64 input");
++        let content = &input["<video>(data:".len()..input.len() - 1];
++        let tokens: Vec<&str> = content.split(';').collect();
++        if tokens.len() != 2 {
++            return Err(ValidationError::InvalidVideoContent(content.to_string()));
++        }
++        let mimetype = tokens[0];
++        let content = tokens[1];
++        if !content.starts_with("base64,") {
++            return Err(ValidationError::InvalidVideoContent(content.to_string()));
++        }
++        let data = STANDARD.decode(&content["base64,".len()..])?;
++        
++        // Create temp file for base64 data
++        let temp_file = NamedTempFile::new().map_err(ValidationError::IoError)?;
++        temp_file.as_file().write_all(&data).map_err(ValidationError::IoError)?;
++        (data, mimetype.to_string(), temp_file.path().to_str().unwrap().to_string(), Some(temp_file))
++    } else {
++        println!("Invalid input format: {}", input);
++        return Err(ValidationError::InvalidVideoContent(input.to_string()));
++    };
+ 
+-    // init ffmpeg
+-    ffmpeg::init().map_err(|_| ValidationError::FFmpegError)?;
+-
+-    // create temporary file for ffmpeg input
+-    let mut temp_file = tempfile::NamedTempFile::new().map_err(ValidationError::IoError)?;
+-    temp_file
+-        .write_all(&data)
+-        .map_err(ValidationError::IoError)?;
+-
+-    let mut ictx =
+-        ffmpeg::format::input(&temp_file.path()).map_err(|_| ValidationError::FFmpegError)?;
+-
+-    let input = ictx
+-        .streams()
+-        .best(Type::Video)
+-        .ok_or(ValidationError::FFmpegError)?;
+-    let video_stream_index = input.index();
+-
+-    let context_decoder = ffmpeg::codec::context::Context::from_parameters(input.parameters())
+-        .map_err(|_| ValidationError::FFmpegError)?;
+-    let mut decoder = context_decoder
+-        .decoder()
+-        .video()
+-        .map_err(|_| ValidationError::FFmpegError)?;
+-
+-    let width = target_width;
+-    let height = target_height;
+-
+-    let mut scaler = Context::get(
+-        decoder.format(),
+-        decoder.width(), // original width
+-        decoder.height(),
+-        Pixel::RGB24,
+-        width, // target width
+-        height,
+-        Flags::BILINEAR,
+-    )
+-    .map_err(|_| ValidationError::FFmpegError)?;
+-
+-    let mut frame_index = 0;
+-    let mut captured_frame_index = 0;
+-    let mut frames = vec![];
+-
+-    let mut receive_and_process_decoded_frames =
+-        |decoder: &mut ffmpeg::decoder::Video, raw_fps: f32| -> Result<(), ffmpeg::Error> {
+-            let mut decoded = ffmpeg::util::frame::video::Video::empty();
+-            let fps = raw_fps.floor();
+-            while decoder.receive_frame(&mut decoded).is_ok() {
+-                let mut rgb_frame = ffmpeg::util::frame::video::Video::empty();
+-                scaler.run(&decoded, &mut rgb_frame)?;
+-                if frame_index as f32 % fps == 0.0 {
+-                    captured_frame_index += 1;
+-                    // Create new buffer without padding
+-                    let mut frame_data = Vec::with_capacity((rgb_frame.width() * rgb_frame.height() * 3) as usize);
+-                    let src_data = rgb_frame.data(0);
+-                    let row_size = rgb_frame.width() as usize * 3;
+-                    
+-                    // Copy each row without padding
+-                    for y in 0..rgb_frame.height() as usize {
+-                        let start = y * rgb_frame.stride(0) as usize;
+-                        let end = start + row_size;
+-                        frame_data.extend_from_slice(&src_data[start..end]);
+-                    }
+-                    frames.push(frame_data);
++    println!("Using source path: {}", source_path);
++
++    // Check FFmpeg availability
++    println!("Checking FFmpeg availability...");
++    match Command::new("ffmpeg").arg("-version").output() {
++        Ok(output) => println!("FFmpeg is available: {}", String::from_utf8_lossy(&output.stdout).lines().next().unwrap_or("unknown version")),
++        Err(e) => {
++            println!("FFmpeg not found: {}", e);
++            return Err(ValidationError::FFmpegError("FFmpeg not available".to_string()));
++        }
++    }
++
++    // Get video information using ffprobe
++    println!("Running ffprobe command...");
++    let probe_args = [
++        "-v", "error",
++        "-select_streams", "v:0",
++        "-show_entries", "stream=r_frame_rate,nb_frames",
++        "-of", "default=noprint_wrappers=1:nokey=1",
++        &source_path
++    ];
++    println!("FFprobe command: ffprobe {}", probe_args.join(" "));
++    
++    let probe_output = Command::new("ffprobe")
++        .args(&probe_args)
++        .output()
++        .map_err(|e| {
++            println!("FFprobe failed to execute: {}", e);
++            ValidationError::FFmpegError(format!("FFprobe execution failed: {}", e))
++        })?;
++
++    if !probe_output.status.success() {
++        println!("FFprobe error:");
++        println!("stdout: {}", String::from_utf8_lossy(&probe_output.stdout));
++        println!("stderr: {}", String::from_utf8_lossy(&probe_output.stderr));
++        return Err(ValidationError::FFmpegError("FFprobe failed".to_string()));
++    }
++
++    // Create temporary output directory for frames
++    let output_dir = tempfile::tempdir().map_err(ValidationError::IoError)?;
++    let output_pattern = output_dir.path().join("frame_%d.ppm").to_str().unwrap().to_string();
++
++    // Parse frame rate and total frames
++    let info = String::from_utf8_lossy(&probe_output.stdout);
++    println!("FFprobe output: {}", info);
++    let mut lines = info.lines();
++    
++    // Parse framerate
++    let fps_str = lines.next()
++        .ok_or_else(|| ValidationError::FFmpegError("No framerate found".to_string()))?;
++    println!("Framerate string: {}", fps_str);
++    
++    let (num, den) = fps_str.trim().split_once('/')
++        .ok_or_else(|| ValidationError::FFmpegError("Invalid framerate format".to_string()))?;
++    let num: f32 = num.parse().map_err(|_| ValidationError::FFmpegError("Invalid framerate numerator".to_string()))?;
++    let den: f32 = den.parse().map_err(|_| ValidationError::FFmpegError("Invalid framerate denominator".to_string()))?;
++    let fps = (num / den).floor();
++    println!("Calculated FPS: {}", fps);
++
++    let fps_target = 1;
++    // Parse total frames
++    let total_frames = lines.next()
++        .ok_or_else(|| ValidationError::FFmpegError("No frame count found".to_string()))?
++        .trim()
++        .parse::<usize>()
++        .map_err(|_| ValidationError::FFmpegError("Invalid frame count".to_string()))?;
++    println!("Total frames: {}", total_frames);
++
++    // Extract frames using ffmpeg
++    println!("Running FFmpeg for frame extraction...");
++    let ffmpeg_args = [
++        "-i", &source_path,
++        "-vf", &format!("fps={},scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2", 
++            fps_target, target_width, target_height, target_width, target_height),
++        "-pix_fmt", "rgb24",
++        "-vsync", "0",
++        &output_pattern
++    ];
++    println!("FFmpeg command: ffmpeg {}", ffmpeg_args.join(" "));
++    
++    let ffmpeg_output = Command::new("ffmpeg")
++        .args(&ffmpeg_args)
++        .output()
++        .map_err(|e| {
++            println!("FFmpeg failed to execute: {}", e);
++            ValidationError::FFmpegError(format!("FFmpeg execution failed: {}", e))
++        })?;
++
++    if !ffmpeg_output.status.success() {
++        println!("FFmpeg error:");
++        println!("stdout: {}", String::from_utf8_lossy(&ffmpeg_output.stdout));
++        println!("stderr: {}", String::from_utf8_lossy(&ffmpeg_output.stderr));
++        return Err(ValidationError::FFmpegError("FFmpeg frame extraction failed".to_string()));
++    }
++
++    // Read frames
++    println!("Reading extracted frames...");
++    let mut frames = Vec::new();
++    let mut frame_count = 0;
++
++    // Read each frame file
++    loop {
++        frame_count += 1;
++        let frame_path = output_dir.path().join(format!("frame_{}.ppm", frame_count));
++        if !frame_path.exists() {
++            println!("No more frames found after frame_{}", frame_count - 1);
++            break;
++        }
++
++        println!("Reading frame {}", frame_count);
++        
++        let mut file = std::fs::File::open(&frame_path)
++            .map_err(|e| {
++                println!("Failed to open frame file {}: {}", frame_path.display(), e);
++                ValidationError::FFmpegError(format!("Failed to open frame file {}: {}", frame_path.display(), e))
++            })?;
++
++        // Read PPM header using bytes instead of UTF-8 strings
++        let mut reader = BufReader::new(&file);
++        let mut header_bytes = Vec::new();
++        let mut line_count = 0;
++        let mut width = 0;
++        let mut height = 0;
++        
++        // Read header line by line
++        loop {
++            let mut line = Vec::new();
++            let bytes_read = reader.read_until(b'\n', &mut line)
++                .map_err(|e| ValidationError::FFmpegError(format!("Failed to read PPM header: {}", e)))?;
++            
++            if bytes_read == 0 {
++                return Err(ValidationError::FFmpegError("Unexpected end of file".to_string()));
++            }
++            
++            header_bytes.extend_from_slice(&line);
++            line_count += 1;
++
++            // Parse dimensions from second line (after P6)
++            if line_count == 2 {
++                // Convert bytes to string, skipping any non-UTF8 characters
++                let line_str = String::from_utf8_lossy(&line);
++                let dims: Vec<&str> = line_str.trim().split_whitespace().collect();
++                if dims.len() != 2 {
++                    println!("Invalid PPM dimensions line: {:?}", line);
++                    return Err(ValidationError::FFmpegError("Invalid PPM dimensions".to_string()));
+                 }
+-                frame_index += 1;
++                width = dims[0].parse::<u32>()
++                    .map_err(|_| ValidationError::FFmpegError("Invalid PPM width".to_string()))?;
++                height = dims[1].parse::<u32>()
++                    .map_err(|_| ValidationError::FFmpegError("Invalid PPM height".to_string()))?;
+             }
+-            Ok(())
+-        };
+ 
+-    let mut fps = 0.0;
+-    let mut total_frames = 0;
++            // PPM header is complete after reading 3 lines (magic number, dimensions, max value)
++            if line_count == 3 {
++                break;
++            }
++        }
+ 
+-    for (stream, packet) in ictx.packets() {
+-        total_frames = stream.frames();
+-        // Floor the fps to get a whole number
+-        fps = (stream.rate().numerator() as f32 / stream.rate().denominator() as f32).floor();
++        println!("PPM header bytes: {:?}", header_bytes);
++        println!("Expected dimensions: {}x{}x3", target_height, target_width);
++        println!("Actual PPM dimensions: {}x{}x3", height, width);
+ 
+-        if stream.index() == video_stream_index {
+-            decoder
+-                .send_packet(&packet)
+-                .map_err(|_| ValidationError::FFmpegError)?;
+-            receive_and_process_decoded_frames(&mut decoder, fps)
+-                .map_err(|_| ValidationError::FFmpegError)?;
++        // Verify dimensions
++        if width != target_width || height != target_height {
++            println!("Dimension mismatch - PPM: {}x{}, Target: {}x{}", width, height, target_width, target_height);
++            return Err(ValidationError::FFmpegError(
++                format!("Frame dimensions mismatch. Expected: {}x{}, Got: {}x{}", 
++                        target_width, target_height, width, height)
++            ));
+         }
++
++        // Read RGB data
++        let expected_size = (target_width * target_height * 3) as usize;
++        let mut frame_data = vec![0u8; expected_size];
++        let bytes_read = reader.read_exact(&mut frame_data)
++            .map_err(|e| {
++                println!("Failed to read frame data: {}", e);
++                ValidationError::FFmpegError(format!("Failed to read frame data: {}", e))
++            })?;
++
++        frames.push(frame_data);
++        println!("Successfully read frame {}", frame_count);
++    }
++
++    let frames_len = frames.len();
++    if frames_len == 0 {
++        println!("Error: No frames were extracted");
++        return Err(ValidationError::FFmpegError("No frames were extracted".to_string()));
+     }
+-    decoder
+-        .send_eof()
+-        .map_err(|_| ValidationError::FFmpegError)?;
+-
+-    let total_frames = total_frames.try_into().map_err(|_| {
+-        ValidationError::InvalidVideoContent(
+-            "Total frames is too large to be represented as usize".to_string(),
+-        )
+-    })?;
++
++    println!("Video processing completed successfully");
++    
+     Ok(ProcessedVideo {
+         mimetype,
+-        height,
+-        width,
++        height: target_height,
++        width: target_width,
+         frames,
+         fps,
+         total_frames,
+-        sampled_frames: captured_frame_index,
++        sampled_frames: frames_len,
+     })
+ }
+ 
++
++
+ fn fetch_image(input: &str) -> Result<(Vec<u8>, String, usize, usize), ValidationError> {
+     if input.starts_with("![](http://") || input.starts_with("![](https://") {
+         let url = &input["![](".len()..input.len() - 1];
+@@ -1011,6 +1116,12 @@ pub struct ValidGenerateRequest {
+ 
+ #[derive(Error, Debug)]
+ pub enum ValidationError {
++    #[error("ffmpeg error: {0}")]
++    FFmpegError(String),
++    #[error("io error: {0}")]
++    IoError(#[from] std::io::Error),
++    #[error("invalid video content: {0}")]
++    InvalidVideoContent(String),
+     #[error("`best_of` must be > 0 and <= {0}. Given: {1}")]
+     BestOf(usize, usize),
+     #[error("`best_of` != 1 is not allowed for this endpoint")]
+@@ -1075,16 +1186,6 @@ pub enum ValidationError {
+     FailedFetchImage(#[from] reqwest::Error),
+     #[error("{0} modality is not supported")]
+     UnsupportedModality(&'static str),
+-    #[error("invalid video content: {0}")]
+-    InvalidVideoContent(String),
+-    #[error("could not parse MP4 file")]
+-    MP4Error,
+-    #[error("no video stream found")]
+-    NoVideoStream,
+-    #[error("io error: {0}")]
+-    IoError(#[from] std::io::Error),
+-    #[error("ffmpeg error")]
+-    FFmpegError,
+ }
+ 
+ #[cfg(test)]

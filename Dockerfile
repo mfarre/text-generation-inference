@@ -21,19 +21,6 @@ FROM chef AS builder
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     python3.11-dev
 
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    libavcodec-dev \
-    libavfilter-dev \
-    libavdevice-dev \
-    libavformat-dev \
-    libavutil-dev \
-    libswscale-dev \
-    pkg-config \
-    libclang-dev \
-    clang \
-    && rm -rf /var/lib/apt/lists/*
-
 RUN PROTOC_ZIP=protoc-21.12-linux-x86_64.zip && \
     curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v21.12/$PROTOC_ZIP && \
     unzip -o $PROTOC_ZIP -d /usr/local bin/protoc && \
@@ -212,9 +199,6 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Add ffmpeg libraries to the path
-ENV LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
-
 # Copy conda with PyTorch installed
 COPY --from=pytorch-install /opt/conda /opt/conda
 
@@ -271,6 +255,7 @@ ENV EXLLAMA_NO_FLASH_ATTN=1
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     build-essential \
     g++ \
+    ffmpeg \ 
     && rm -rf /var/lib/apt/lists/*
 
 # Install benchmarker
@@ -280,9 +265,6 @@ COPY --from=builder /usr/src/target/release-opt/text-generation-router /usr/loca
 # Install launcher
 COPY --from=builder /usr/src/target/release-opt/text-generation-launcher /usr/local/bin/text-generation-launcher
 
-# Copy the ffmpeg libraries
-COPY --from=builder /usr/lib/x86_64-linux-gnu/* /usr/lib/x86_64-linux-gnu-copy/
-ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/lib/x86_64-linux-gnu-copy"
 
 # AWS Sagemaker compatible image
 FROM base AS sagemaker

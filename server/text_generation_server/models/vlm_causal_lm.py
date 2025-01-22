@@ -267,16 +267,46 @@ class VlmCausalLMBatch(FlashCausalLMBatch):
             image_inputs = None
 
         video_inputs = None
+        from loguru import logger
+
         if videos:
+            log_master(
+                logger.info,
+                f"Video content type {videos} ",
+            )
+            value = videos[0].shape if hasattr(videos[0], 'shape') else len(videos[0])
+            log_master(
+                logger.info,
+                f"First video content {type(videos[0])} - {value} ",
+            )
+
             try:
                 video_inputs = processor.image_processor(
                     videos,
                     return_tensors="pt",
                 )
+
+                log_master(
+                logger.info,
+                f"Video inputs type {type(video_inputs)} ",
+                )
+                log_master(
+                logger.info,
+                f"Video inputs content {video_inputs} ",
+                )
+
             except Exception as e:
+                log_master(
+                    logger.info,
+                    f"Failed to process video: {e} ",
+                )
                 print(f"Failed to process video: {e}")
                 pass
         else:
+            log_master(
+                logger.info,
+                f"there are no video inputs ",
+            )
             video_inputs = None
 
         batch_inputs = []

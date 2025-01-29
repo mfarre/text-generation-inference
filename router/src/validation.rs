@@ -6,7 +6,7 @@ use crate::{
     TokenizerTrait,
 };
 use std::process::Command;
-use std::io::{Write, BufReader, BufRead, Read};
+use std::io::{Write, BufReader, BufRead, Read, Seek};
 use tempfile::NamedTempFile;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use crate::{PyTokenizer, Tokenizer};
@@ -521,161 +521,18 @@ fn format_to_mimetype(format: ImageFormat) -> String {
     }
     .to_string()
 }
-/*pub fn fetch_video(
-    input: &str,
-    target_width: u32,
-    target_height: u32,
-) -> Result<ProcessedVideo, ValidationError> {
-    println!("Starting video processing with dimensions: {}x{}", target_width, target_height);
-    
-    // Extract video data and create input source
-    let (data, mimetype, source_path, _temp_holder) = if input.starts_with("<video>(http://") || input.starts_with("<video>(https://") {
-        println!("Detected URL input");
-        let url = &input["<video>(".len()..input.len() - 1];
-        println!("Extracted URL: {}", url);
-        (Vec::new(), "video/mp4".to_string(), url.to_string(), None)
-    } else if input.starts_with("<video>(data:") {
-        println!("Detected base64 input");
-        let content = &input["<video>(data:".len()..input.len() - 1];
-        let tokens: Vec<&str> = content.split(';').collect();
-        if tokens.len() != 2 {
-            return Err(ValidationError::InvalidVideoContent(content.to_string()));
-        }
-        let mimetype = tokens[0];
-        let content = tokens[1];
-        if !content.starts_with("base64,") {
-            return Err(ValidationError::InvalidVideoContent(content.to_string()));
-        }
-        let data = STANDARD.decode(&content["base64,".len()..])?;
-        
-        // Create temp file for base64 data
-        let temp_file = NamedTempFile::new().map_err(ValidationError::IoError)?;
-        temp_file.as_file().write_all(&data).map_err(ValidationError::IoError)?;
-        (data, mimetype.to_string(), temp_file.path().to_str().unwrap().to_string(), Some(temp_file))
-    } else {
-        println!("Invalid input format: {}", input);
-        return Err(ValidationError::InvalidVideoContent(input.to_string()));
-    };
-
-    // Get video information using ffprobe
-    println!("Running ffprobe command...");
-    let probe_args = [
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=r_frame_rate,nb_frames",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        &source_path
-    ];
-    
-    let probe_output = Command::new("ffprobe")
-        .args(&probe_args)
-        .output()
-        .map_err(|e| ValidationError::FFmpegError(format!("FFprobe execution failed: {}", e)))?;
-
-    if !probe_output.status.success() {
-        return Err(ValidationError::FFmpegError("FFprobe failed".to_string()));
-    }
-
-    // Parse video information
-    let info = String::from_utf8_lossy(&probe_output.stdout);
-    let mut lines = info.lines();
-    
-    // Parse framerate
-    let fps_str = lines.next()
-        .ok_or_else(|| ValidationError::FFmpegError("No framerate found".to_string()))?;
-    println!("Framerate string: {}", fps_str);
-    
-    let (num, den) = fps_str.trim().split_once('/')
-        .ok_or_else(|| ValidationError::FFmpegError("Invalid framerate format".to_string()))?;
-    let num: f32 = num.parse().map_err(|_| ValidationError::FFmpegError("Invalid framerate numerator".to_string()))?;
-    let den: f32 = den.parse().map_err(|_| ValidationError::FFmpegError("Invalid framerate denominator".to_string()))?;
-    let fps = (num / den).floor();
-    println!("Calculated FPS: {}", fps);
-
-    // Parse total frames
-    let total_frames = lines.next()
-        .ok_or_else(|| ValidationError::FFmpegError("No frame count found".to_string()))?
-        .trim()
-        .parse::<usize>()
-        .map_err(|_| ValidationError::FFmpegError("Invalid frame count".to_string()))?;
-    println!("Total frames in source: {}", total_frames);
-
-    // Create temporary output file for raw video data
-    let output_file = NamedTempFile::new().map_err(ValidationError::IoError)?;
-    let output_path = output_file.path().to_str().unwrap();
-
-    // Extract frames using ffmpeg - output as raw RGB24 data
-    println!("Extracting frames as raw RGB24 data...");
-
-    let ffmpeg_args = [
-        "-y",  // Force overwrite without prompting
-        "-i", &source_path,
-        "-vf", &format!("fps=1,scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2",
-            target_width, target_height, target_width, target_height),
-        "-f", "rawvideo",
-        "-pix_fmt", "rgb24",
-        output_path
-    ];
-
-    println!("FFmpeg command: {:?}", ffmpeg_args);
-
-    let ffmpeg_output = Command::new("ffmpeg")
-        .args(&ffmpeg_args)
-        .output()
-        .map_err(|e| ValidationError::FFmpegError(format!("FFmpeg frame extraction failed: {}", e)))?;
-
-    if !ffmpeg_output.status.success() {
-        println!("FFmpeg error:");
-        println!("stdout: {}", String::from_utf8_lossy(&ffmpeg_output.stdout));
-        println!("stderr: {}", String::from_utf8_lossy(&ffmpeg_output.stderr));
-        return Err(ValidationError::FFmpegError("FFmpeg frame extraction failed".to_string()));
-    }
-
-    // Read the raw RGB24 data
-    let mut frame_data = Vec::new();
-    let mut file = std::fs::File::open(output_path).map_err(ValidationError::IoError)?;
-    file.read_to_end(&mut frame_data).map_err(ValidationError::IoError)?;
-
-    // Calculate number of frames based on file size
-    let bytes_per_frame = (target_width * target_height * 3) as usize;
-    let num_frames = frame_data.len() / bytes_per_frame;
-    let frames_len = num_frames;  // Store for later use
-
-    // Split data into frames
-    let frames: Vec<Vec<u8>> = frame_data
-        .chunks(bytes_per_frame)
-        .map(|chunk| chunk.to_vec())
-        .collect();
-
-    println!("Video processing completed successfully - {} frames processed", frames_len);
-    
-    Ok(ProcessedVideo {
-        mimetype,
-        height: target_height,
-        width: target_width,
-        frames,
-        fps,
-        total_frames,  // Now using the parsed total_frames from ffprobe
-        sampled_frames: frames_len,
-    })
-}
-*/
 
 pub fn fetch_video(
     input: &str,
     target_width: u32,
     target_height: u32,
 ) -> Result<ProcessedVideo, ValidationError> {
-    println!("Starting video processing with dimensions: {}x{}", target_width, target_height);
     
     // Extract video data and create input source
     let (data, mimetype, source_path, _temp_holder) = if input.starts_with("<video>(http://") || input.starts_with("<video>(https://") {
-        println!("Detected URL input");
         let url = &input["<video>(".len()..input.len() - 1];
-        println!("Extracted URL: {}", url);
         (Vec::new(), "video/mp4".to_string(), url.to_string(), None)
     } else if input.starts_with("<video>(data:") {
-        println!("Detected base64 input");
         let content = &input["<video>(data:".len()..input.len() - 1];
         let tokens: Vec<&str> = content.split(';').collect();
         if tokens.len() != 2 {
@@ -693,12 +550,10 @@ pub fn fetch_video(
         temp_file.as_file().write_all(&data).map_err(ValidationError::IoError)?;
         (data, mimetype.to_string(), temp_file.path().to_str().unwrap().to_string(), Some(temp_file))
     } else {
-        println!("Invalid input format: {}", input);
         return Err(ValidationError::InvalidVideoContent(input.to_string()));
     };
 
     // Get video information using ffprobe
-    println!("Running ffprobe command...");
     let probe_args = [
         "-v", "error",
         "-select_streams", "v:0",
@@ -706,7 +561,6 @@ pub fn fetch_video(
         "-of", "default=noprint_wrappers=1:nokey=1",
         &source_path
     ];
-    println!("FFprobe command: {}", probe_args.join(" "));
     
     let probe_output = Command::new("ffprobe")
         .args(&probe_args)
@@ -714,28 +568,22 @@ pub fn fetch_video(
         .map_err(|e| ValidationError::FFmpegError(format!("FFprobe execution failed: {}", e)))?;
 
     if !probe_output.status.success() {
-        println!("FFprobe error:");
-        println!("stdout: {}", String::from_utf8_lossy(&probe_output.stdout));
-        println!("stderr: {}", String::from_utf8_lossy(&probe_output.stderr));
         return Err(ValidationError::FFmpegError("FFprobe failed".to_string()));
     }
 
     // Parse video information
     let info = String::from_utf8_lossy(&probe_output.stdout);
-    println!("FFprobe output: {}", info);
     let mut lines = info.lines();
     
     // Parse framerate
     let fps_str = lines.next()
         .ok_or_else(|| ValidationError::FFmpegError("No framerate found".to_string()))?;
-    println!("Framerate string: {}", fps_str);
     
     let (num, den) = fps_str.trim().split_once('/')
         .ok_or_else(|| ValidationError::FFmpegError("Invalid framerate format".to_string()))?;
     let num: f32 = num.parse().map_err(|_| ValidationError::FFmpegError("Invalid framerate numerator".to_string()))?;
     let den: f32 = den.parse().map_err(|_| ValidationError::FFmpegError("Invalid framerate denominator".to_string()))?;
     let fps = (num / den).floor();
-    println!("Calculated FPS: {}", fps);
 
     // Parse total frames
     let total_frames = lines.next()
@@ -743,14 +591,12 @@ pub fn fetch_video(
         .trim()
         .parse::<usize>()
         .map_err(|_| ValidationError::FFmpegError("Invalid frame count".to_string()))?;
-    println!("Total frames in source: {}", total_frames);
 
     // Create temporary output file for raw video data
     let output_file = NamedTempFile::new().map_err(ValidationError::IoError)?;
     let output_path = output_file.path().to_str().unwrap();
 
     // Extract frames using ffmpeg - output as raw RGB24 data
-    println!("Extracting frames as raw RGB24 data...");
     let ffmpeg_args = [
         "-y",  // Force overwrite without prompting
         "-i", &source_path,
@@ -760,7 +606,6 @@ pub fn fetch_video(
         "-pix_fmt", "rgb24",
         output_path
     ];
-    println!("FFmpeg command: {}", ffmpeg_args.join(" "));
     
     let ffmpeg_output = Command::new("ffmpeg")
         .args(&ffmpeg_args)
@@ -768,18 +613,28 @@ pub fn fetch_video(
         .map_err(|e| ValidationError::FFmpegError(format!("FFmpeg frame extraction failed: {}", e)))?;
 
     if !ffmpeg_output.status.success() {
-        println!("FFmpeg error:");
-        println!("stdout: {}", String::from_utf8_lossy(&ffmpeg_output.stdout));
-        println!("stderr: {}", String::from_utf8_lossy(&ffmpeg_output.stderr));
         return Err(ValidationError::FFmpegError("FFmpeg frame extraction failed".to_string()));
     }
 
     // Read the raw RGB24 data
-    let mut raw_data = Vec::new();
     let mut file = std::fs::File::open(output_path).map_err(ValidationError::IoError)?;
+
+    // After FFmpeg runs, let's check the file size
+    let file_metadata = std::fs::metadata(output_path).map_err(ValidationError::IoError)?;
+
+    // And let's dump the first few bytes to be sure
+    let mut first_bytes = vec![0u8; 24];  // First 8 pixels worth of RGB data
+    let mut file = std::fs::File::open(output_path).map_err(ValidationError::IoError)?;
+    file.read_exact(&mut first_bytes).map_err(ValidationError::IoError)?;
+
+    // Then continue with rest of file reading
+    file.seek(std::io::SeekFrom::Start(0)).map_err(ValidationError::IoError)?;
+    let mut raw_data: Vec<u8> = Vec::new();
     file.read_to_end(&mut raw_data).map_err(ValidationError::IoError)?;
 
-    // Process frames to match the old ffmpeg-next output format
+
+
+    // Process frames to match tensor format exactly
     let bytes_per_frame = (target_width * target_height * 3) as usize;
     let num_frames = raw_data.len() / bytes_per_frame;
     let mut frames = Vec::with_capacity(num_frames);
@@ -788,18 +643,12 @@ pub fn fetch_video(
         let mut frame_data = Vec::with_capacity(bytes_per_frame);
         let frame_start = frame_idx * bytes_per_frame;
 
-        // Copy row by row to match the old format's row-wise copying
-        for y in 0..target_height as usize {
-            let row_start = frame_start + (y * target_width as usize * 3);
-            let row_end = row_start + (target_width as usize * 3);
-            frame_data.extend_from_slice(&raw_data[row_start..row_end]);
-        }
-
+        // First read entire RGB frame
+        frame_data.extend_from_slice(&raw_data[frame_start..frame_start + bytes_per_frame]);
         frames.push(frame_data);
     }
 
     let frames_len = frames.len();
-    println!("Video processing completed successfully - {} frames processed", frames_len);
     
     Ok(ProcessedVideo {
         mimetype,
@@ -811,8 +660,6 @@ pub fn fetch_video(
         sampled_frames: frames_len,
     })
 }
-
-
 fn fetch_image(input: &str) -> Result<(Vec<u8>, String, usize, usize), ValidationError> {
     if input.starts_with("![](http://") || input.starts_with("![](https://") {
         let url = &input["![](".len()..input.len() - 1];
